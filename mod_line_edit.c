@@ -381,11 +381,20 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
    * That means concepts like one-match-per-line or start-of-line-only
    * won't work, except for the first rule.  So we won't pretend.
    */
+  static apr_bucket_type_t s_pool_marker, s_immortal_marker;
+  if(s_pool_marker.name == NULL) {
+      /* We use the marker type to mark the newly splitted "matched" buket,,
+       * so that we won't apply other rules to them. 
+       */
+      s_pool_marker = apr_bucket_type_pool;
+      s_immortal_marker = apr_bucket_type_immortal;
+#define BUCKET_IS_MARKER(e) ((e)->type==&s_pool_marker || (e)->type==&s_immortal_marker)
+  }
   for (i = 0; i < ctx->rewriterules->nelts; ++i) {
     for ( b = APR_BRIGADE_FIRST(bbline) ;
 	b != APR_BRIGADE_SENTINEL(bbline) ;
 	b = APR_BUCKET_NEXT(b) ) {
-      if ( !APR_BUCKET_IS_METADATA(b)
+      if ( !APR_BUCKET_IS_METADATA(b) && !BUCKET_IS_MARKER(b)
 	&& (apr_bucket_read(b, &buf, &bytes, APR_BLOCK_READ) == APR_SUCCESS)) {
 	if ( rules[i].flags & M_REGEX ) {
 	  bufp = apr_pstrmemdup(ctx->lpool, buf, bytes) ;
@@ -399,6 +408,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 	    apr_bucket_delete(b1) ;
 	    b1 = apr_bucket_pool_create(subs, strlen(subs), f->r->pool,
 		  f->r->connection->bucket_alloc) ;
+            b1->type = &s_pool_marker;
 	    APR_BUCKET_INSERT_BEFORE(b, b1) ;
 	    bufp += pmatch[0].rm_eo ;
 	  }
@@ -418,6 +428,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 	    bufp += rules[i].length ;
 	    b1 = apr_bucket_immortal_create(rules[i].to, strlen(rules[i].to),
 		f->r->connection->bucket_alloc) ;
+            b1->type = &s_immortal_marker;
 	    APR_BUCKET_INSERT_BEFORE(b, b1) ;
 	  }
 	}
