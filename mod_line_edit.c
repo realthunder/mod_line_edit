@@ -53,15 +53,23 @@
 #define M_NOCASE	0x08
 #define M_NEWLINE	0x10
 #define M_ENV		0x20
+#define M_ENV_FROM	0x40
 
+typedef struct {
+  const char* env;
+  const char* val;
+  int rel;
+} rewritecond;
 typedef struct {
   union {
     const apr_strmatch_pattern* s;
     const ap_regex_t* r ;
   } from ;
+  const char *from_save;
   const char* to ;
   unsigned int flags ;
   unsigned int length ;
+  rewritecond *cond;
 } rewriterule ;
 
 typedef struct {
@@ -121,6 +129,22 @@ static const char* interpolate_env(request_rec *r, const char *str) {
     return apr_pstrcat(r->pool, firstpart, val,
 	interpolate_env(r, end+1), NULL);
   }
+}
+static void compile_rule(apr_pool_t *pool, rewriterule *rule) {
+    int lflags = 0 ;
+    if ( rule->flags & M_REGEX ) {
+        if ( rule->flags & M_NOCASE ) {
+            lflags |= AP_REG_ICASE;
+        }
+        if ( rule->flags & M_NEWLINE ) {
+            lflags |= AP_REG_NEWLINE;
+        }
+        rule->from.r = ap_pregcomp(pool, rule->from_save, lflags) ;
+    } else {
+        lflags = (rule->flags & M_NOCASE) ? 0 : 1 ;
+        rule->length = strlen(rule->from_save) ;
+        rule->from.s = apr_strmatch_precompile(pool, rule->from_save, lflags) ;
+    }
 }
 static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
   int i, j;
@@ -195,39 +219,43 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
         break ;
       }
     }
-    /* If we have env interpolation, we'll need a private copy of
-     * our rewrite rules with this requests env.  Otherwise we can
-     * save processing time by using the original.
-     *
-     * If one ENV is found, we also have to copy all previous and
-     * subsequent rules, even those with no interpolation.
-     */
-    ctx->rewriterules = cfg->rewriterules;
+
+    ctx->rewriterules = apr_array_make(f->r->pool,
+            cfg->rewriterules->nelts, sizeof(rewriterule));
+
     for (i = 0; i < cfg->rewriterules->nelts; ++i) {
-      found |= (rules[i].flags & M_ENV) ;
-      if ( found ) {
-	if (ctx->rewriterules == cfg->rewriterules) {
-	  ctx->rewriterules = apr_array_make(f->r->pool,
-		cfg->rewriterules->nelts, sizeof(rewriterule));
-	  for (j = 0; j < i; ++j) {
-            newrule = apr_array_push (((line_edit_ctx*)ctx)->rewriterules) ;
-	    newrule->from = rules[j].from;
-	    newrule->to = rules[j].to;
-	    newrule->flags = rules[j].flags;
-	    newrule->length = rules[j].length;
-	  }
-	}
-	/* this rule needs to be interpolated */
+        if(rules[i].cond) {
+            rewriterule *p = &rules[i];
+            int has_cond = -1;
+            const char *thisval = apr_table_get(f->r->subprocess_env, p->cond->env);
+            if (!p->cond->val) {
+                /* required to be "anything" */
+                if (thisval)
+                    has_cond = 1;	/* satisfied */
+                else
+                    has_cond = 0;	/* unsatisfied */
+            } else {
+                if (thisval && !strcasecmp(p->cond->val, thisval)) {
+                    has_cond = 1;	/* satisfied */
+                } else {
+                    has_cond = 0;	/* unsatisfied */
+                }
+            }
+            if (((has_cond == 0) && (p->cond->rel ==1 ))
+                    || ((has_cond == 1) && (p->cond->rel == -1))) {
+                continue;  /* condition is unsatisfied */
+            }
+        }
         newrule = apr_array_push (((line_edit_ctx*)ctx)->rewriterules) ;
-	newrule->from = rules[i].from;
-	if (rules[i].flags & M_ENV) {
+        *newrule = rules[i];
+
+	if (rules[i].flags & M_ENV) 
 	  newrule->to = interpolate_env(f->r, rules[i].to);
-	} else {
-	  newrule->to = rules[i].to ;
+
+        if (rules[i].flags & M_ENV_FROM) {
+	  newrule->from_save = interpolate_env(f->r, rules[i].from_save);
+          compile_rule(f->r->pool,newrule);
 	}
-	newrule->flags = rules[i].flags;
-	newrule->length = rules[i].length;
-      }
     }
     /* for back-compatibility with Apache 2.0, set some protocol stuff */
     apr_table_unset(f->r->headers_out, "Content-Length") ;
@@ -493,11 +521,46 @@ static const char* line_edit_lineend(cmd_parms* cmd,
 }
 
 #define REGFLAG(n,s,c) ( (s&&(ap_strchr((char*)(s),(c))!=NULL)) ? (n) : 0 )
-static const char* line_edit_rewriterule(cmd_parms* cmd, void* cfg,
-		const char* from, const char* to, const char* flags) {
+static const char* line_edit_rewriterule(cmd_parms* cmd, void* cfg, const char *args) {
   rewriterule* rule = apr_array_push (((line_edit_cfg*)cfg)->rewriterules) ;
-  int lflags = 0 ;
+  const char* usage =
+	"Usage: LERewriteRule from-pattern to-pattern [flags] [cond]";
+  const char* from;
+  const char* to;
+  const char* flags;
+  const char* cond = NULL;
+  
+  if (from = ap_getword_conf(cmd->pool, &args), !from)
+    return usage;
+  if (to = ap_getword_conf(cmd->pool, &args), !to)
+    return usage;
+  flags = ap_getword_conf(cmd->pool, &args);
+  if (flags && *flags)
+    cond = ap_getword_conf(cmd->pool, &args);
+  if (cond && !*cond)
+    cond = NULL;
 
+  if (cond != NULL) {
+    char *eq;
+    char* cond_copy;
+    rule->cond = apr_pcalloc(cmd->pool, sizeof(rewritecond));
+    if (cond[0] == '!') {
+      rule->cond->rel = -1;
+      rule->cond->env = cond_copy = apr_pstrdup(cmd->pool, cond+1);
+    } else {
+      rule->cond->rel = 1;
+      rule->cond->env = cond_copy = apr_pstrdup(cmd->pool, cond);
+    }
+    eq = ap_strchr(++cond_copy, '=');
+    if (eq) {
+      *eq = 0;
+      rule->cond->val = eq+1;
+    }
+  } else {
+    rule->cond = NULL;
+  }
+
+  rule->from_save = from;
   rule->to = to ;
   if ( flags ) {
     rule->flags
@@ -505,31 +568,21 @@ static const char* line_edit_rewriterule(cmd_parms* cmd, void* cfg,
 	| REGFLAG(M_NOCASE, flags, 'i')
 	| REGFLAG(M_NEWLINE, flags, 'm')
 	| REGFLAG(M_ENV, flags, 'V')
+	| REGFLAG(M_ENV_FROM, flags, 'v')
 	;
   } else {
     rule->flags = 0 ;
   }
-  if ( rule->flags & M_REGEX ) {
-    if ( rule->flags & M_NOCASE ) {
-      lflags |= AP_REG_ICASE;
-    }
-    if ( rule->flags & M_NEWLINE ) {
-      lflags |= AP_REG_NEWLINE;
-    }
-    rule->from.r = ap_pregcomp(cmd->pool, from, lflags) ;
-  } else {
-    lflags = (rule->flags & M_NOCASE) ? 0 : 1 ;
-    rule->length = strlen(from) ;
-    rule->from.s = apr_strmatch_precompile(cmd->pool, from, lflags) ;
-  }
+  if(!(rule->flags & M_ENV_FROM)) 
+      compile_rule(cmd->pool,rule);
   return NULL;
 }
 
 static const command_rec line_edit_cmds[] = {
   AP_INIT_TAKE12("LELineEnd", line_edit_lineend, NULL, OR_ALL,
 	"Use line ending: UNIX|MAC|DOS|ANY|NONE|CUSTOM [char]") ,
-  AP_INIT_TAKE23("LERewriteRule", line_edit_rewriterule, NULL, OR_ALL,
-	"Line-oriented text rewrite rule: From-pattern, To-pattern [, Flags]") ,
+  AP_INIT_RAW_ARGS("LERewriteRule", line_edit_rewriterule, NULL,
+	RSRC_CONF|ACCESS_CONF, "Line-oriented text rewrite rule: From, To [, Flags] [cond]") ,
   {NULL}
 } ;
 static void* line_edit_cr_cfg(apr_pool_t* pool, char* x) {
