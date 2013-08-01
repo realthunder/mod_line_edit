@@ -309,7 +309,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 	  }
 	  if ( le ) {
 	    /* found a lineend in this bucket. */
-	    offs = 1 + ((unsigned int)le-(unsigned int)buf) / sizeof(char) ;
+	    offs = 1 + ((size_t)le-(size_t)buf) / sizeof(char) ;
 	    apr_bucket_split(b, offs) ;
 	    bytes -= offs ;
 	    buf += offs ;
@@ -406,7 +406,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 	  bufp = buf ;
 	  while (subs = apr_strmatch(rules[i].from.s, bufp, bytes),
 			subs != NULL) {
-	    match = ((unsigned int)subs - (unsigned int)bufp) / sizeof(char) ;
+	    match = ((size_t)subs - (size_t)bufp) / sizeof(char) ;
 	    bytes -= match ;
 	    bufp += match ;
 	    apr_bucket_split(b, match) ;
