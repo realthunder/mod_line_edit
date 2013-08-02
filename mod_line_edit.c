@@ -23,6 +23,8 @@
 
 #include <ctype.h>
 
+#include <pcre.h>
+
 #include <httpd.h>
 #include <http_config.h>
 #include <http_log.h>
@@ -93,7 +95,6 @@ static const char* const line_edit_filter_name = "line-editor" ;
 
 typedef struct {
   apr_bucket_brigade* bbsave ;
-  apr_pool_t* lpool ;
   apr_array_header_t* rewriterules ; /* make a copy if per-request
 					interpolation is wanted */
 } line_edit_ctx ;
@@ -156,7 +157,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
   int i, j;
   unsigned int match ;
   unsigned int nmatch = 10 ;
-  ap_regmatch_t pmatch[10] ;
+  ap_regmatch_t pmatch[15] ;
   const char* bufp;
   const char* subs ;
   apr_size_t bytes ;
@@ -210,21 +211,6 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 
     ctx = f->ctx = apr_palloc(f->r->pool, sizeof(line_edit_ctx)) ;
     ctx->bbsave = apr_brigade_create(f->r->pool, f->c->bucket_alloc) ;
-
-    /* If we have any regex matches, we'll need to copy everything, so we
-     * have null-terminated strings to parse.  That's a lot of memory if
-     * we're streaming anything big.  So we'll use (and reuse) a local
-     * subpool.  Fall back to the request pool if anything bad happens.
-     */
-    ctx->lpool = f->r->pool ;
-    for (i = 0; i < cfg->rewriterules->nelts; ++i) {
-      if ( rules[i].flags & M_REGEX ) {
-        if (apr_pool_create(&ctx->lpool, f->r->pool) != APR_SUCCESS) {
-	  ctx->lpool = f->r->pool ;
-        }
-        break ;
-      }
-    }
 
     ctx->rewriterules = apr_array_make(f->r->pool,
             cfg->rewriterules->nelts, sizeof(rewriterule));
@@ -444,10 +430,17 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
       if ( !APR_BUCKET_IS_METADATA(b) && !BUCKET_IS_MARKER(b)
 	&& (apr_bucket_read(b, &buf, &bytes, APR_BLOCK_READ) == APR_SUCCESS)) {
 	if ( rules[i].flags & M_REGEX ) {
-	  bufp = apr_pstrmemdup(ctx->lpool, buf, bytes) ;
-	  while ( ! ap_regexec(rules[i].from.r, bufp, nmatch, pmatch, 0) ) {
+          int rc;
+          bufp = buf;
+          /* Apache's ap_regexec is kinda dumb, because it demands a null 
+           * terminated string, while the actual worker pcre_exec only needs
+           * the string length. Better use pcre_exec directly.
+           */
+          while((rc=pcre_exec((const pcre*)rules[i].from.r->re_pcre,0,
+                  bufp,bytes,0,0,(int*)pmatch,nmatch*3))>=0 ){
+            if(rc==0) rc = nmatch;
 	    match = pmatch[0].rm_so ;
-	    subs = ap_pregsub(f->r->pool, rules[i].to, bufp, nmatch, pmatch) ;
+	    subs = ap_pregsub(f->r->pool, rules[i].to, bufp, rc, pmatch) ;
 	    apr_bucket_split(b, match) ;
 	    b1 = APR_BUCKET_NEXT(b) ;
 	    apr_bucket_split(b1, pmatch[0].rm_eo - match) ;
@@ -458,6 +451,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
             b1->type = &s_pool_marker;
 	    APR_BUCKET_INSERT_BEFORE(b, b1) ;
 	    bufp += pmatch[0].rm_eo ;
+            bytes -= pmatch[0].rm_eo ;
 	  }
 	} else {
 	  bufp = buf ;
@@ -480,10 +474,6 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 	  }
 	}
       }
-    }
-    /* If we used a local pool, clear it now */
-    if ( (ctx->lpool != f->r->pool) && (rules[i].flags & M_REGEX) ) {
-      apr_pool_clear(ctx->lpool) ;
     }
   }
 
