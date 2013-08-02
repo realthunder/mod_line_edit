@@ -25,6 +25,7 @@
 
 #include <httpd.h>
 #include <http_config.h>
+#include <http_log.h>
 #include <util_filter.h>
 
 #include <apr_strmatch.h>
@@ -126,11 +127,13 @@ static const char* interpolate_env(request_rec *r, const char *str) {
   if (val == NULL) {
     return apr_pstrcat(r->pool, firstpart, interpolate_env(r, end+1), NULL);
   } else {
+    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
+			"Interpolating %s  =>  %s", var, val) ;
     return apr_pstrcat(r->pool, firstpart, val,
 	interpolate_env(r, end+1), NULL);
   }
 }
-static void compile_rule(apr_pool_t *pool, rewriterule *rule) {
+static int compile_rule(apr_pool_t *pool, rewriterule *rule) {
     int lflags = 0 ;
     if ( rule->flags & M_REGEX ) {
         if ( rule->flags & M_NOCASE ) {
@@ -139,12 +142,15 @@ static void compile_rule(apr_pool_t *pool, rewriterule *rule) {
         if ( rule->flags & M_NEWLINE ) {
             lflags |= AP_REG_NEWLINE;
         }
-        rule->from.r = ap_pregcomp(pool, rule->from_save, lflags) ;
+        if((rule->from.r = ap_pregcomp(pool, rule->from_save, lflags))==NULL){
+            return 1;
+        }
     } else {
         lflags = (rule->flags & M_NOCASE) ? 0 : 1 ;
         rule->length = strlen(rule->from_save) ;
         rule->from.s = apr_strmatch_precompile(pool, rule->from_save, lflags) ;
     }
+    return 0;
 }
 static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
   int i, j;
@@ -224,10 +230,14 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
             cfg->rewriterules->nelts, sizeof(rewriterule));
 
     for (i = 0; i < cfg->rewriterules->nelts; ++i) {
+        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r,
+                "LERewriteRule: from: %s  to: %s", rules[i].from_save,rules[i].to) ;
         if(rules[i].cond) {
             rewriterule *p = &rules[i];
             int has_cond = -1;
             const char *thisval = apr_table_get(f->r->subprocess_env, p->cond->env);
+            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r,
+                "  cond: %s, %s", rules[i].cond->env,rules[i].cond->val?rules[i].cond->val:"") ;
             if (!p->cond->val) {
                 /* required to be "anything" */
                 if (thisval)
@@ -243,6 +253,8 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
             }
             if (((has_cond == 0) && (p->cond->rel ==1 ))
                     || ((has_cond == 1) && (p->cond->rel == -1))) {
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r,
+                        "      : filtered") ;
                 continue;  /* condition is unsatisfied */
             }
         }
@@ -254,7 +266,14 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 
         if (rules[i].flags & M_ENV_FROM) {
 	  newrule->from_save = interpolate_env(f->r, rules[i].from_save);
-          compile_rule(f->r->pool,newrule);
+          if(compile_rule(f->r->pool,newrule)) {
+              ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+                      "reg compile failed for: %s", newrule->from_save) ;
+              /* bail out*/
+              ap_filter_t* fnext = f->next ;
+              ap_remove_output_filter(f) ;
+              return ap_pass_brigade(fnext, bb) ;
+          }
 	}
     }
     /* for back-compatibility with Apache 2.0, set some protocol stuff */
@@ -573,8 +592,13 @@ static const char* line_edit_rewriterule(cmd_parms* cmd, void* cfg, const char *
   } else {
     rule->flags = 0 ;
   }
-  if(!(rule->flags & M_ENV_FROM)) 
-      compile_rule(cmd->pool,rule);
+  if(!(rule->flags & M_ENV_FROM)) {
+      if(compile_rule(cmd->pool,rule)){
+          ap_log_error(APLOG_MARK, APLOG_ERR, 0, cmd->server,
+                  "failed to compile rule: %s", rule->from_save) ;
+          return usage;
+      }
+  }
   return NULL;
 }
 
