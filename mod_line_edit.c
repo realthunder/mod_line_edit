@@ -57,6 +57,10 @@
 #define M_NEWLINE	0x10
 #define M_ENV		0x20
 #define M_ENV_FROM	0x40
+#define M_START	        0x80
+#define M_END	        0x100
+#define M_EXCLUSIVE     0x200
+#define M_END_EX        0x300
 
 typedef struct {
   const char* env;
@@ -72,6 +76,7 @@ typedef struct {
   const char* to ;
   unsigned int flags ;
   unsigned int length ;
+  unsigned int to_length ;
   rewritecond *cond;
 } rewriterule ;
 
@@ -87,6 +92,7 @@ typedef struct {
   } lineend ;
   apr_array_header_t* rewriterules ;
   int lechar;
+  int verbose;
 } line_edit_cfg ;
 
 module AP_MODULE_DECLARE_DATA line_edit_module ;
@@ -97,6 +103,10 @@ typedef struct {
   apr_bucket_brigade* bbsave ;
   apr_array_header_t* rewriterules ; /* make a copy if per-request
 					interpolation is wanted */
+  rewriterule *rulestart;
+  rewriterule *ruleend;
+  request_rec *pending;
+  int offs;
 } line_edit_ctx ;
 
 static const char* interpolate_env(request_rec *r, const char *str) {
@@ -128,8 +138,7 @@ static const char* interpolate_env(request_rec *r, const char *str) {
   if (val == NULL) {
     return apr_pstrcat(r->pool, firstpart, interpolate_env(r, end+1), NULL);
   } else {
-    ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r,
-			"Interpolating %s  =>  %s", var, val) ;
+    ap_log_rerror(APLOG_MARK,APLOG_DEBUG,0,r,"Interpolating %s  =>  %s", var, val) ;
     return apr_pstrcat(r->pool, firstpart, val,
 	interpolate_env(r, end+1), NULL);
   }
@@ -149,12 +158,29 @@ static int compile_rule(apr_pool_t *pool, rewriterule *rule) {
     } else {
         lflags = (rule->flags & M_NOCASE) ? 0 : 1 ;
         rule->length = strlen(rule->from_save) ;
+        rule->to_length = strlen(rule->to) ;
         rule->from.s = apr_strmatch_precompile(pool, rule->from_save, lflags) ;
     }
     return 0;
 }
+int check_save(ap_filter_t* f, apr_bucket **pb, 
+        const char **pbuf, apr_size_t *pbytes) {
+    line_edit_ctx *ctx = f->ctx;
+    int rv;
+    apr_bucket *b1,*b=*pb;
+    if (APR_BRIGADE_EMPTY(ctx->bbsave) || ctx->offs<0) return 0;
+    b1 = APR_BUCKET_NEXT(b) ;
+    APR_BUCKET_REMOVE(b);
+    APR_BRIGADE_INSERT_TAIL(ctx->bbsave, b) ;
+    rv = apr_brigade_pflatten(ctx->bbsave, (char**)pbuf, pbytes, f->r->pool) ;
+    *pb = b = apr_bucket_pool_create(*pbuf, *pbytes, f->r->pool,
+            f->r->connection->bucket_alloc) ;
+    apr_brigade_cleanup(ctx->bbsave) ;
+    APR_BUCKET_INSERT_BEFORE(b1,b);
+    return rv != APR_SUCCESS || *pbytes == 0;
+}
 static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
-  int i, j;
+  int i, j, rc;
   unsigned int match ;
   unsigned int nmatch = 10 ;
   ap_regmatch_t pmatch[15] ;
@@ -215,15 +241,19 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
     ctx->rewriterules = apr_array_make(f->r->pool,
             cfg->rewriterules->nelts, sizeof(rewriterule));
 
+#define RLOG(_l,_r,_msg,...) do{\
+        if(cfg->verbose) \
+            ap_log_rerror(APLOG_MARK,APLOG_##_l,0,_r,_msg,##__VA_ARGS__);\
+    }while(0)
+#define RDEBUG(_r,_msg,...) RLOG(INFO,_r,_msg,##__VA_ARGS__)
+
     for (i = 0; i < cfg->rewriterules->nelts; ++i) {
-        ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r,
-                "LERewriteRule: from: %s  to: %s", rules[i].from_save,rules[i].to) ;
+        RDEBUG(f->r,"LERewriteRule: from: %s  to: %s", rules[i].from_save,rules[i].to) ;
         if(rules[i].cond) {
             rewriterule *p = &rules[i];
             int has_cond = -1;
             const char *thisval = apr_table_get(f->r->subprocess_env, p->cond->env);
-            ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r,
-                "  cond: %s, %s", rules[i].cond->env,rules[i].cond->val?rules[i].cond->val:"") ;
+            RDEBUG(f->r, "  cond: %s, %s", rules[i].cond->env,rules[i].cond->val?rules[i].cond->val:"") ;
             if (!p->cond->val) {
                 /* required to be "anything" */
                 if (thisval)
@@ -239,12 +269,16 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
             }
             if (((has_cond == 0) && (p->cond->rel ==1 ))
                     || ((has_cond == 1) && (p->cond->rel == -1))) {
-                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, f->r,
-                        "      : filtered") ;
+                RDEBUG(f->r, "      : filtered") ;
                 continue;  /* condition is unsatisfied */
             }
         }
-        newrule = apr_array_push (((line_edit_ctx*)ctx)->rewriterules) ;
+        if (rules[i].flags & M_START)
+            ctx->rulestart = newrule = apr_pcalloc(f->r->pool,sizeof(*newrule));
+        else if(rules[i].flags & M_END)
+            ctx->ruleend = newrule = apr_pcalloc(f->r->pool,sizeof(*newrule));
+        else
+            newrule = apr_array_push (((line_edit_ctx*)ctx)->rewriterules) ;
         *newrule = rules[i];
 
 	if (rules[i].flags & M_ENV) 
@@ -275,6 +309,57 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
    */
   bbline = apr_brigade_create(f->r->pool, f->c->bucket_alloc) ;
 
+  /* Since we now support arbitary line start and line end using
+   * regex, we need some way to skip any non matching characters
+   * in between end and start. We use the following marker to mark
+   * the bucket before passing to bbline
+   */
+  static apr_bucket_type_t s_pool_skip, s_heap_skip, 
+    s_trans_skip, s_immortal_skip;
+  if(s_pool_skip.name == NULL) {
+      s_pool_skip = apr_bucket_type_pool;
+      s_heap_skip = apr_bucket_type_heap;
+      s_trans_skip = apr_bucket_type_transient;
+      s_immortal_skip = apr_bucket_type_immortal;
+#define BUCKET_CAN_SKIP(e) (APR_BUCKET_IS_TRANSIENT(e) ||\
+        APR_BUCKET_IS_HEAP(e) || \
+        APR_BUCKET_IS_POOL(e) || \
+        APR_BUCKET_IS_IMMORTAL(e))
+#define BUCKET_IS_SKIPPED(e) ((e)->type==&s_trans_skip || \
+        (e)->type==&s_heap_skip || \
+        (e)->type==&s_pool_skip || \
+        (e)->type==&s_immortal_skip)
+#define RDEBUG_BUCKET(e,msg,...) do{\
+        if(cfg->verbose) {\
+            const char *_buf;\
+            apr_size_t _bytes;\
+            if (apr_bucket_read(e, &_buf, &_bytes, APR_BLOCK_READ)==APR_SUCCESS){\
+                char *_s = apr_pstrndup(f->r->pool,_buf,_bytes);\
+                ap_log_rerror(APLOG_MARK,APLOG_INFO,0,f->r,msg " bucket: %s",##__VA_ARGS__,_s);\
+            }else\
+                ap_log_rerror(APLOG_MARK,APLOG_ERR,0,f->r,"bucket failed to read");\
+        }\
+      }while(0)
+#define BUCKET_MOVE_(a,d,e) do {\
+        apr_bucket *_b = APR_BUCKET_NEXT(e);\
+        RDEBUG_BUCKET(e,#a " " #d);\
+        APR_BUCKET_REMOVE(e);\
+        APR_BRIGADE_INSERT_TAIL(d, e);\
+        e = _b;\
+      }while(0)
+#define BUCKET_MOVE(d,e) BUCKET_MOVE_(move,d,e)
+#define BUCKET_SKIP(e) do {\
+        if(APR_BUCKET_IS_TRANSIENT(e))\
+            (e)->type = &s_trans_skip;\
+        else if(APR_BUCKET_IS_HEAP(e))\
+            (e)->type = &s_heap_skip;\
+        else if(APR_BUCKET_IS_POOL(e))\
+            (e)->type = &s_pool_skip;\
+        else if(APR_BUCKET_IS_IMMORTAL(e)) \
+            (e)->type = &s_immortal_skip;\
+        BUCKET_MOVE_(skip,bbline,e);\
+      }while(0)
+  }
   /* first ensure we have no mid-line breaks that might be in the
    * middle of a search string causing us to miss it!  At the same
    * time we split into lines to avoid pattern-matching over big
@@ -282,10 +367,97 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
    */
   while ( b != APR_BRIGADE_SENTINEL(bb) ) {
     if ( !APR_BUCKET_IS_METADATA(b) ) {
+      bytes = 0;
       if ( apr_bucket_read(b, &buf, &bytes, APR_BLOCK_READ) == APR_SUCCESS ) {
 	if ( bytes == 0 ) {
 	  APR_BUCKET_REMOVE(b) ;
+        }else if(!BUCKET_CAN_SKIP(b)) {
+          RLOG(WARNING,f->r, "bypass unknown bucket: %s", b->type->name?b->type->name:"?") ;
+          ctx->pending = 0;
+          check_save(f,&b,&buf,&bytes);
+          BUCKET_MOVE(bbline,b);
+          continue;
 	} else while ( bytes > 0 ) {
+          if(ctx->rulestart && ctx->pending != f->r) {
+            ctx->offs = 0;
+            if(check_save(f,&b,&buf,&bytes)) break;
+            if(!(ctx->rulestart->flags & M_REGEX)) {
+                subs=apr_strmatch(ctx->rulestart->from.s, buf, bytes);
+                if(subs == NULL) 
+                    /* no match, save some data for next round match*/
+                    match = bytes<=ctx->rulestart->length?0:(bytes-ctx->rulestart->length);
+                else
+                    match = (size_t)subs - (size_t)buf;
+                if(match) {
+                    apr_bucket_split(b, match) ;
+                    BUCKET_SKIP(b);
+                }
+                if(subs){
+                    ctx->pending = f->r;
+                    ctx->offs = ctx->rulestart->length;
+                }else
+                    BUCKET_MOVE(ctx->bbsave,b);
+                break;
+            }else if((rc=pcre_exec((const pcre*)ctx->rulestart->from.r->re_pcre,0,
+                        buf,bytes,0,PCRE_PARTIAL,(int*)pmatch,nmatch*3))>=0 || 
+                      rc == PCRE_ERROR_PARTIAL){
+                if((match = pmatch[0].rm_so)) {
+                    apr_bucket_split(b, match) ;
+                    BUCKET_SKIP(b);
+                }
+                if(rc != PCRE_ERROR_PARTIAL){
+                    ctx->pending = f->r;
+                    ctx->offs = pmatch[0].rm_eo - match;
+                }else
+                    BUCKET_MOVE(ctx->bbsave,b);
+                break;
+            }else{
+                BUCKET_SKIP(b);
+                break;
+            }
+          }
+
+          if(ctx->ruleend) {
+            int found = 0;
+            if(check_save(f,&b,&buf,&bytes)) break;
+            match = 0;
+            if(ctx->ruleend->flags & M_REGEX){
+                if(ctx->offs<0) ctx->offs = 0;
+                if((rc=pcre_exec((const pcre*)ctx->ruleend->from.r->re_pcre,0,
+                    buf+ctx->offs,bytes-ctx->offs,0,PCRE_PARTIAL,(int*)pmatch,nmatch*3))>=0)
+                {
+                    found = 1;
+                    if(ctx->ruleend->flags & M_EXCLUSIVE)
+                        match = pmatch[0].rm_so+ctx->offs;
+                    else
+                        match = pmatch[0].rm_eo+ctx->offs;
+                }
+            }else if((subs=apr_strmatch(ctx->ruleend->from.s, buf+ctx->offs, bytes-ctx->offs))){
+                found = 1;
+                match = (size_t)subs - (size_t)buf + ctx->offs;
+                if(!(ctx->ruleend->flags & M_EXCLUSIVE))
+                    match += ctx->ruleend->length;
+            }
+            ctx->offs = 0;
+            if(found){
+                if(match) apr_bucket_split(b, match) ;
+                /*in case previous offs==-1, we still have dangling content in bbsave*/
+                check_save(f,&b,&buf,&bytes);
+                BUCKET_MOVE(bbline,b);
+                ctx->pending = 0;
+                break;
+            }
+            if(ctx->ruleend->flags & M_REGEX) {
+                if(rc == PCRE_ERROR_PARTIAL)
+                    ctx->offs += pmatch[0].rm_so;
+                else
+                    ctx->offs = -1;
+            }else if(bytes > ctx->ruleend->length)
+                ctx->offs = bytes - ctx->ruleend->length;
+            BUCKET_MOVE(ctx->bbsave,b);
+            break;
+          }
+
 	  switch (cfg->lineend) {
 
 	  case LINEEND_UNIX:
@@ -364,6 +536,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 	    /* b now contains exactly one line */
 	    APR_BRIGADE_INSERT_TAIL(bbline, b);
 	    b = b1 ;
+            ctx->pending = 0;
 	  } else {
 	    /* no lineend found.  Remember the dangling content */
 	    APR_BUCKET_REMOVE(b);
@@ -381,7 +554,11 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
         rv = apr_brigade_pflatten(ctx->bbsave, &fbuf, &fbytes, f->r->pool) ;
         b1 = apr_bucket_pool_create(fbuf, fbytes, f->r->pool,
 		f->r->connection->bucket_alloc) ;
+        b1->type = &s_pool_skip;
+        RDEBUG_BUCKET(b1,"flush");
         APR_BRIGADE_INSERT_TAIL(bbline, b1);
+        ctx->pending = 0;
+        ctx->offs = 0;
       }
       apr_brigade_cleanup(ctx->bbsave) ;
       /* start again rather than segfault if a seriously buggy
@@ -414,23 +591,13 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
    * That means concepts like one-match-per-line or start-of-line-only
    * won't work, except for the first rule.  So we won't pretend.
    */
-  static apr_bucket_type_t s_pool_marker, s_immortal_marker;
-  if(s_pool_marker.name == NULL) {
-      /* We use the marker type to mark the newly splitted "matched" buket,,
-       * so that we won't apply other rules to them. 
-       */
-      s_pool_marker = apr_bucket_type_pool;
-      s_immortal_marker = apr_bucket_type_immortal;
-#define BUCKET_IS_MARKER(e) ((e)->type==&s_pool_marker || (e)->type==&s_immortal_marker)
-  }
   for (i = 0; i < ctx->rewriterules->nelts; ++i) {
     for ( b = APR_BRIGADE_FIRST(bbline) ;
 	b != APR_BRIGADE_SENTINEL(bbline) ;
 	b = APR_BUCKET_NEXT(b) ) {
-      if ( !APR_BUCKET_IS_METADATA(b) && !BUCKET_IS_MARKER(b)
+      if ( !APR_BUCKET_IS_METADATA(b) && !BUCKET_IS_SKIPPED(b)
 	&& (apr_bucket_read(b, &buf, &bytes, APR_BLOCK_READ) == APR_SUCCESS)) {
 	if ( rules[i].flags & M_REGEX ) {
-          int rc;
           bufp = buf;
           /* Apache's ap_regexec is kinda dumb, because it demands a null 
            * terminated string, while the actual worker pcre_exec only needs
@@ -441,36 +608,45 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
             if(rc==0) rc = nmatch;
 	    match = pmatch[0].rm_so ;
 	    subs = ap_pregsub(f->r->pool, rules[i].to, bufp, rc, pmatch) ;
-	    apr_bucket_split(b, match) ;
-	    b1 = APR_BUCKET_NEXT(b) ;
-	    apr_bucket_split(b1, pmatch[0].rm_eo - match) ;
-	    b = APR_BUCKET_NEXT(b1) ;
-	    apr_bucket_delete(b1) ;
-	    b1 = apr_bucket_pool_create(subs, strlen(subs), f->r->pool,
+            if(match) {
+                apr_bucket_split(b, match) ;
+                b = APR_BUCKET_NEXT(b) ;
+            }
+            if(pmatch[0].rm_eo < bytes)
+                apr_bucket_split(b, pmatch[0].rm_eo - match) ;
+            RDEBUG_BUCKET(b,"replace %s -> %s,",rules[i].from_save,subs);
+            b1 = APR_BUCKET_NEXT(b) ;
+            apr_bucket_delete(b) ;
+	    b = apr_bucket_pool_create(subs, strlen(subs), f->r->pool,
 		  f->r->connection->bucket_alloc) ;
-            b1->type = &s_pool_marker;
-	    APR_BUCKET_INSERT_BEFORE(b, b1) ;
+            b->type = &s_pool_skip;
+	    APR_BUCKET_INSERT_BEFORE(b1, b) ;
+            b = b1;
 	    bufp += pmatch[0].rm_eo ;
             bytes -= pmatch[0].rm_eo ;
 	  }
 	} else {
 	  bufp = buf ;
-	  while (subs = apr_strmatch(rules[i].from.s, bufp, bytes),
-			subs != NULL) {
-	    match = ((size_t)subs - (size_t)bufp) / sizeof(char) ;
-	    bytes -= match ;
-	    bufp += match ;
-	    apr_bucket_split(b, match) ;
-	    b1 = APR_BUCKET_NEXT(b) ;
-	    apr_bucket_split(b1, rules[i].length) ;
-	    b = APR_BUCKET_NEXT(b1) ;
-	    apr_bucket_delete(b1) ;
+	  while (subs = apr_strmatch(rules[i].from.s, bufp, bytes), subs != NULL) {
+	    match = (size_t)subs - (size_t)bufp;
+            if(match) {
+                bytes -= match ;
+                bufp += match ;
+                apr_bucket_split(b, match) ;
+                b = APR_BUCKET_NEXT(b) ;
+            }
+            if(rules[i].length < bytes)
+                apr_bucket_split(b, rules[i].length) ;
+            RDEBUG_BUCKET(b,"replace %s -> %s,",rules[i].from_save,rules[i].to);
+            b1 = APR_BUCKET_NEXT(b) ;
+	    apr_bucket_delete(b) ;
 	    bytes -= rules[i].length ;
 	    bufp += rules[i].length ;
-	    b1 = apr_bucket_immortal_create(rules[i].to, strlen(rules[i].to),
+	    b = apr_bucket_immortal_create(rules[i].to, rules[i].to_length,
 		f->r->connection->bucket_alloc) ;
-            b1->type = &s_immortal_marker;
-	    APR_BUCKET_INSERT_BEFORE(b, b1) ;
+            b->type = &s_immortal_skip;
+	    APR_BUCKET_INSERT_BEFORE(b1, b) ;
+            b = b1;
 	  }
 	}
       }
@@ -578,6 +754,9 @@ static const char* line_edit_rewriterule(cmd_parms* cmd, void* cfg, const char *
 	| REGFLAG(M_NEWLINE, flags, 'm')
 	| REGFLAG(M_ENV, flags, 'V')
 	| REGFLAG(M_ENV_FROM, flags, 'v')
+	| REGFLAG(M_START, flags, 's')
+	| REGFLAG(M_END, flags, 'e')
+	| REGFLAG(M_END_EX, flags, 'E')
 	;
   } else {
     rule->flags = 0 ;
@@ -597,6 +776,9 @@ static const command_rec line_edit_cmds[] = {
 	"Use line ending: UNIX|MAC|DOS|ANY|NONE|CUSTOM [char]") ,
   AP_INIT_RAW_ARGS("LERewriteRule", line_edit_rewriterule, NULL,
 	RSRC_CONF|ACCESS_CONF, "Line-oriented text rewrite rule: From, To [, Flags] [cond]") ,
+  AP_INIT_FLAG("LEVerbose", ap_set_flag_slot,
+          (void*)APR_OFFSETOF(line_edit_cfg, verbose),
+          RSRC_CONF|ACCESS_CONF, "Turn on verbose log" ) ,
   {NULL}
 } ;
 static void* line_edit_cr_cfg(apr_pool_t* pool, char* x) {
@@ -617,6 +799,7 @@ static void* line_edit_merge(apr_pool_t* pool, void* BASE, void* ADD) {
   conf->rewriterules
 	  = apr_array_append(pool, base->rewriterules, add->rewriterules) ;
   conf->lechar = (add->lechar == 0) ? base->lechar : add->lechar;
+  conf->verbose = add->verbose ? 1 : base->verbose;
   return conf ;
 }
 
