@@ -7,8 +7,10 @@ Added feature:
 * Allow at most one match per position. Original implementation split a matched line as three lines, before + matched + after. And the rest rules will be applyed to these new lines, too, which may cause multiple match and sustitution in the same position. This is clearly not users' intention.
 * Add flag v to LERewriteRule to interpolate the 'from' part of the rule.
 * Add 'cond' to LERewriteRule just like ProxyHTMLURLMap in mod_proxy_html to conditionally enable/disable rules based on environment variable. Quote from mod_proxy_html,
+
 >The optional cond argument specifies a condition to test before the parse. If a condition is unsatisfied, the URLMap will be ignored in this parse.
 >
 >The condition takes the form [!]var[=val], and is satisfied if the value of environment variable var is val. If the optional =val is omitted, then any value of var satisfies the condition, provided only it is set to something. If the first character is !, the condition is reversed.
+
 * Added flag 's/e/E' to LERewriteRule to mark for line start/end/exclusive-end. The 'to' part of the rule is ignored. Exclusive-end excludes the matched string when capturing the line. When line-end rule is given, LELineEnd is ignored.
 
