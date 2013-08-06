@@ -320,10 +320,6 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
       s_heap_skip = apr_bucket_type_heap;
       s_trans_skip = apr_bucket_type_transient;
       s_immortal_skip = apr_bucket_type_immortal;
-#define BUCKET_CAN_SKIP(e) (APR_BUCKET_IS_TRANSIENT(e) ||\
-        APR_BUCKET_IS_HEAP(e) || \
-        APR_BUCKET_IS_POOL(e) || \
-        APR_BUCKET_IS_IMMORTAL(e))
 #define BUCKET_IS_SKIPPED(e) ((e)->type==&s_trans_skip || \
         (e)->type==&s_heap_skip || \
         (e)->type==&s_pool_skip || \
@@ -356,6 +352,22 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
             (e)->type = &s_pool_skip;\
         else if(APR_BUCKET_IS_IMMORTAL(e)) \
             (e)->type = &s_immortal_skip;\
+        else{\
+          const char *_buf;\
+          apr_size_t _bytes;\
+          if(apr_bucket_read(e, &_buf, &_bytes, APR_BLOCK_READ) == APR_SUCCESS ) {\
+              apr_bucket *_b = APR_BUCKET_NEXT(e);\
+              RLOG(WARNING,f->r, "unknown bucket type: %s, copy %u", \
+                      b->type->name?b->type->name:"?",(unsigned)_bytes);\
+              _buf = apr_pmemdup(f->r->pool,_buf,_bytes);\
+              apr_bucket_delete(e);\
+	      e = apr_bucket_pool_create(_buf, _bytes, f->r->pool,\
+			f->r->connection->bucket_alloc);\
+              (e)->type = &s_pool_skip;\
+              APR_BUCKET_INSERT_BEFORE(_b, e);\
+          }else\
+              RLOG(ERR,f->r,"bucket read failed, cannot skip");\
+        }\
         BUCKET_MOVE_(skip,bbline,e);\
       }while(0)
   }
@@ -370,12 +382,6 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
       if ( apr_bucket_read(b, &buf, &bytes, APR_BLOCK_READ) == APR_SUCCESS ) {
 	if ( bytes == 0 ) {
 	  APR_BUCKET_REMOVE(b) ;
-        }else if(!BUCKET_CAN_SKIP(b)) {
-          RLOG(WARNING,f->r, "bypass unknown bucket: %s", b->type->name?b->type->name:"?") ;
-          ctx->pending = 0;
-          check_save(f,&b,&buf,&bytes);
-          BUCKET_MOVE(bbline,b);
-          continue;
 	} else while ( bytes > 0 ) {
           if(ctx->rulestart && ctx->pending != f->r) {
             ctx->offs = 0;
