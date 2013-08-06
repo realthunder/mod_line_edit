@@ -2,10 +2,13 @@ This is a fork of apache mod_line_edit from webthing (http://apache.webthing.com
 
 Main focus is to make this more efficient for searching and replacing absolute URL, which does not really need a context aware parser. For relative URL, it is best to use a module with parser like mod_proxy_html.
 
-Planed modification:
+Added feature:
 
 * Allow at most one match per position. Original implementation split a matched line as three lines, before + matched + after. And the rest rules will be applyed to these new lines, too, which may cause multiple match and sustitution in the same position. This is clearly not users' intention.
-* Add 'from' interpolate to LERewriteRule
-* Add 'cond' to LERewriteRule just like ProxyHTMLURLMap in mod_proxy_html
-* Allow multiple line-end character. For URL match, any illeagal character can be consider as line-end.
-* Add string marker(s) as line-start, e.g. http://. Probably implement as a new flag to LERewriteRule to make it a special rule.
+* Add flag v to LERewriteRule to interpolate the 'from' part of the rule.
+* Add 'cond' to LERewriteRule just like ProxyHTMLURLMap in mod_proxy_html to conditionally enable/disable rules based on environment variable. Quote from mod_proxy_html,
+>The optional cond argument specifies a condition to test before the parse. If a condition is unsatisfied, the URLMap will be ignored in this parse.
+>
+>The condition takes the form [!]var[=val], and is satisfied if the value of environment variable var is val. If the optional =val is omitted, then any value of var satisfies the condition, provided only it is set to something. If the first character is !, the condition is reversed.
+* Added flag 's/e/E' to LERewriteRule to mark for line start/end/exclusive-end. The 'to' part of the rule is ignored. Exclusive-end excludes the matched string when capturing the line. When line-end rule is given, LELineEnd is ignored.
+
