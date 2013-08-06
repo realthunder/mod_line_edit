@@ -60,7 +60,6 @@
 #define M_START	        0x80
 #define M_END	        0x100
 #define M_EXCLUSIVE     0x200
-#define M_END_EX        0x300
 
 typedef struct {
   const char* env;
@@ -386,28 +385,37 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
                 if(subs == NULL) 
                     /* no match, save some data for next round match*/
                     match = bytes<=ctx->rulestart->length?0:(bytes-ctx->rulestart->length);
-                else
+                else {
                     match = (size_t)subs - (size_t)buf;
+                    if(ctx->rulestart->flags & M_EXCLUSIVE)
+                        match += ctx->rulestart->length;
+                }
                 if(match) {
                     apr_bucket_split(b, match) ;
                     BUCKET_SKIP(b);
                 }
                 if(subs){
                     ctx->pending = f->r;
-                    ctx->offs = ctx->rulestart->length;
+                    if(!(ctx->rulestart->flags & M_EXCLUSIVE))
+                        ctx->offs = ctx->rulestart->length;
                 }else
                     BUCKET_MOVE(ctx->bbsave,b);
                 break;
             }else if((rc=pcre_exec((const pcre*)ctx->rulestart->from.r->re_pcre,0,
                         buf,bytes,0,PCRE_PARTIAL,(int*)pmatch,nmatch*3))>=0 || 
                       rc == PCRE_ERROR_PARTIAL){
-                if((match = pmatch[0].rm_so)) {
+                if(rc==PCRE_ERROR_PARTIAL || !(ctx->rulestart->flags & M_EXCLUSIVE))
+                    match = pmatch[0].rm_so;
+                else
+                    match = pmatch[0].rm_eo;
+                if(match) {
                     apr_bucket_split(b, match) ;
                     BUCKET_SKIP(b);
                 }
                 if(rc != PCRE_ERROR_PARTIAL){
                     ctx->pending = f->r;
-                    ctx->offs = pmatch[0].rm_eo - match;
+                    if(!(ctx->rulestart->flags & M_EXCLUSIVE))
+                        ctx->offs = pmatch[0].rm_eo - match;
                 }else
                     BUCKET_MOVE(ctx->bbsave,b);
                 break;
@@ -756,7 +764,7 @@ static const char* line_edit_rewriterule(cmd_parms* cmd, void* cfg, const char *
 	| REGFLAG(M_ENV_FROM, flags, 'v')
 	| REGFLAG(M_START, flags, 's')
 	| REGFLAG(M_END, flags, 'e')
-	| REGFLAG(M_END_EX, flags, 'E')
+	| REGFLAG(M_EXCLUSIVE, flags, 'E')
 	;
   } else {
     rule->flags = 0 ;
