@@ -163,20 +163,28 @@ static int compile_rule(apr_pool_t *pool, rewriterule *rule) {
     return 0;
 }
 int check_save(ap_filter_t* f, apr_bucket **pb, 
-        const char **pbuf, apr_size_t *pbytes) {
+        const char **pbuf, apr_size_t *pbytes,int append) {
     line_edit_ctx *ctx = f->ctx;
     int rv;
     apr_bucket *b1,*b=*pb;
     if (APR_BRIGADE_EMPTY(ctx->bbsave) || ctx->offs<0) return 0;
-    b1 = APR_BUCKET_NEXT(b) ;
-    APR_BUCKET_REMOVE(b);
-    APR_BRIGADE_INSERT_TAIL(ctx->bbsave, b) ;
+    if(append) {
+        b1 = APR_BUCKET_NEXT(b) ;
+        APR_BUCKET_REMOVE(b);
+        APR_BRIGADE_INSERT_TAIL(ctx->bbsave, b) ;
+    } else
+        b1 = b;
     rv = apr_brigade_pflatten(ctx->bbsave, (char**)pbuf, pbytes, f->r->pool) ;
     *pb = b = apr_bucket_pool_create(*pbuf, *pbytes, f->r->pool,
             f->r->connection->bucket_alloc) ;
     apr_brigade_cleanup(ctx->bbsave) ;
     APR_BUCKET_INSERT_BEFORE(b1,b);
-    return rv != APR_SUCCESS || *pbytes == 0;
+    if(rv != APR_SUCCESS) {
+        ap_log_rerror(APLOG_MARK, APLOG_ERR, 0, f->r,
+                "brigade flatten failed %d", rv);
+        return -1;
+    }
+    return *pbytes == 0;
 }
 static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
   int i, j, rc;
@@ -242,7 +250,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 
 #define RLOG(_l,_r,_msg,...) do{\
         if(cfg->verbose) \
-            ap_log_rerror(APLOG_MARK,APLOG_##_l,0,_r,_msg,##__VA_ARGS__);\
+            ap_log_rerror(APLOG_MARK,APLOG_##_l,0,_r,"[%d] " _msg,__LINE__,##__VA_ARGS__);\
     }while(0)
 #define RDEBUG(_r,_msg,...) RLOG(INFO,_r,_msg,##__VA_ARGS__)
 
@@ -330,9 +338,9 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
             apr_size_t _bytes;\
             if (apr_bucket_read(e, &_buf, &_bytes, APR_BLOCK_READ)==APR_SUCCESS){\
                 char *_s = apr_pstrndup(f->r->pool,_buf,_bytes);\
-                ap_log_rerror(APLOG_MARK,APLOG_INFO,0,f->r,msg " bucket: %s",##__VA_ARGS__,_s);\
+                ap_log_rerror(APLOG_MARK,APLOG_INFO,0,f->r,"[%d] " msg " bucket: %s",__LINE__,##__VA_ARGS__,_s);\
             }else\
-                ap_log_rerror(APLOG_MARK,APLOG_ERR,0,f->r,"bucket failed to read");\
+                ap_log_rerror(APLOG_MARK,APLOG_ERR,0,f->r,"[%d] bucket failed to read", __LINE__);\
         }\
       }while(0)
 #define BUCKET_MOVE_(a,d,e) do {\
@@ -343,6 +351,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
         e = _b;\
       }while(0)
 #define BUCKET_MOVE(d,e) BUCKET_MOVE_(move,d,e)
+#define BUCKET_SAVE(d,e) BUCKET_MOVE_(save,d,e)
 #define BUCKET_SKIP(e) do {\
         if(APR_BUCKET_IS_TRANSIENT(e))\
             (e)->type = &s_trans_skip;\
@@ -385,7 +394,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 	} else while ( bytes > 0 ) {
           if(ctx->rulestart && ctx->pending != f->r) {
             ctx->offs = 0;
-            if(check_save(f,&b,&buf,&bytes)) break;
+            if(check_save(f,&b,&buf,&bytes,1)) break;
             if(!(ctx->rulestart->flags & M_REGEX)) {
                 subs=apr_strmatch(ctx->rulestart->from.s, buf, bytes);
                 if(subs == NULL) 
@@ -405,7 +414,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
                     if(!(ctx->rulestart->flags & M_EXCLUSIVE))
                         ctx->offs = ctx->rulestart->length;
                 }else
-                    BUCKET_MOVE(ctx->bbsave,b);
+                    BUCKET_SAVE(ctx->bbsave,b);
                 break;
             }else if((rc=pcre_exec((const pcre*)ctx->rulestart->from.r->re_pcre,0,
                         buf,bytes,0,PCRE_PARTIAL,(int*)pmatch,nmatch*3))>=0 || 
@@ -421,9 +430,9 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
                 if(rc != PCRE_ERROR_PARTIAL){
                     ctx->pending = f->r;
                     if(!(ctx->rulestart->flags & M_EXCLUSIVE))
-                        ctx->offs = pmatch[0].rm_eo - match;
+                        ctx->offs = pmatch[0].rm_eo - pmatch[0].rm_so;
                 }else
-                    BUCKET_MOVE(ctx->bbsave,b);
+                    BUCKET_SAVE(ctx->bbsave,b);
                 break;
             }else{
                 BUCKET_SKIP(b);
@@ -433,7 +442,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
 
           if(ctx->ruleend) {
             int found = 0;
-            if(check_save(f,&b,&buf,&bytes)) break;
+            if(check_save(f,&b,&buf,&bytes,1)) break;
             match = 0;
             if(ctx->ruleend->flags & M_REGEX){
                 if(ctx->offs<0) ctx->offs = 0;
@@ -456,8 +465,15 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
             if(found){
                 if(match) apr_bucket_split(b, match) ;
                 /*in case previous offs==-1, we still have dangling content in bbsave*/
-                check_save(f,&b,&buf,&bytes);
-                BUCKET_MOVE(bbline,b);
+                b1 = b;
+                if(check_save(f,&b,&buf,&bytes,match) == 0) {
+                    if(b1!=b || match) {
+                        /* NOTE! the current implementation will skip blank
+                         * lines, which is fine if we do not intend to match on
+                         * blank ones */
+                        BUCKET_MOVE(bbline,b);
+                    }
+                }
                 ctx->pending = 0;
                 break;
             }
@@ -468,7 +484,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
                     ctx->offs = -1;
             }else if(bytes > ctx->ruleend->length)
                 ctx->offs = bytes - ctx->ruleend->length;
-            BUCKET_MOVE(ctx->bbsave,b);
+            BUCKET_SAVE(ctx->bbsave,b);
             break;
           }
 
@@ -561,6 +577,7 @@ static apr_status_t line_edit_filter(ap_filter_t* f, apr_bucket_brigade* bb) {
       } else {
 	/* bucket read failed - oops !  Let's remove it. */
 	APR_BUCKET_REMOVE(b);
+        RLOG(ERR,f->r,"bucket read failed");
       }
     } else if ( APR_BUCKET_IS_EOS(b) ) {
       /* If there's data to pass, send it in one bucket */
