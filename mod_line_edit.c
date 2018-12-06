@@ -2,6 +2,9 @@
   Copyright (c) 2005-6, WebThing Ltd
   Author: Nick Kew <nick@webthing.com>
 
+  Copyright (c) 2013-2018, Veno Technology Pte. Ltd.
+  Author: Zheng, Lei <realthunder.dev@gmail.com>
+
   This program is free software; you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
   the Free Software Foundation; either version 2 of the License, or
@@ -19,7 +22,7 @@
 *********************************************************************/
 
 
-#define LINE_EDIT_VERSION "1.0.0"
+#define LINE_EDIT_VERSION "2.0.0"
 
 #include <ctype.h>
 
